@@ -1,0 +1,78 @@
+# Baseline: Qlib + Alpha158(no VWAP) + LightGBM + Top-K, NASDAQ 100 universe.
+#
+# Data note: the bundled qlib US dataset covers 1999-12-31 .. 2020-11-10 and uses
+# split+dividend adjusted prices. Membership of `nasdaq100` is point-in-time
+# (constituents enter/leave on their historical dates), which limits survivorship bias.
+
+experiment:
+  name: lightgbm_alpha158
+  seed: 42
+
+qlib:
+  provider_uri: data/qlib_us
+  region: us
+
+universe:
+  market: nasdaq100     # qlib instruments file (point-in-time membership)
+  benchmark: ^ndx       # NASDAQ-100 index (normalized level; returns are unaffected)
+
+data:
+  start_time: 2007-01-01     # ~1y before train start: warmup for 60-day rolling features
+  end_time: 2020-11-10
+  # processor statistics are fitted on the train segment only (no future info in normalization)
+
+label:
+  horizon: 5                 # return[t] = close[t+5] / close[t+1] - 1
+
+dataset:
+  train: [2008-01-01, 2016-12-31]
+  valid: [2017-01-01, 2018-12-31]
+  test:  [2019-01-01, 2020-11-10]
+  embargo_days: 10           # train/valid ends shifted back so forward labels never overlap the next segment
+
+features:
+  custom_factors: false      # true = Alpha158 + factors/ custom features
+
+model:
+  type: lightgbm
+  early_stopping_rounds: 100   # early stopping maximizes mean daily Rank IC on valid
+  num_boost_round: 800
+  params:
+    # Tuned down from qlib's CSI300 benchmark params: the ~100-name NASDAQ100
+    # cross-section overfits instantly with lr=0.2 / 210 leaves.
+    loss: mse
+    learning_rate: 0.05
+    max_depth: 8
+    num_leaves: 64
+    feature_fraction: 0.8
+    bagging_fraction: 0.8
+    bagging_freq: 1
+    lambda_l1: 10
+    lambda_l2: 100
+    min_data_in_leaf: 200
+    num_threads: 0             # auto
+
+strategy:
+  topk: 10
+  n_drop: 2
+  rebalance_frequency: day
+  hold_thresh: 1
+
+backtest:
+  # backtest window defaults to the test segment
+  initial_capital: 1000000
+  exchange:
+    deal_price: close
+    open_cost: 0.0005        # 5 bps per buy
+    close_cost: 0.0005       # 5 bps per sell
+    min_cost: 1              # 1 USD minimum fee per trade
+    trade_unit: 1            # US market: single-share lots
+
+walk_forward:
+  # rolling yearly windows; each window re-trains from scratch
+  windows:
+    - {train: [2008-01-01, 2014-12-31], valid: [2015-01-01, 2015-12-31], test: [2016-01-01, 2016-12-31]}
+    - {train: [2009-01-01, 2015-12-31], valid: [2016-01-01, 2016-12-31], test: [2017-01-01, 2017-12-31]}
+    - {train: [2010-01-01, 2016-12-31], valid: [2017-01-01, 2017-12-31], test: [2018-01-01, 2018-12-31]}
+    - {train: [2011-01-01, 2017-12-31], valid: [2018-01-01, 2018-12-31], test: [2019-01-01, 2019-12-31]}
+    - {train: [2012-01-01, 2018-12-31], valid: [2019-01-01, 2019-12-31], test: [2020-01-01, 2020-11-10]}

@@ -1,0 +1,41 @@
+# Paper trading configuration. PAPER ONLY by default — live trading is blocked
+# unless allow_live_trading is explicitly set to true (do not do this).
+
+experiment:
+  name: paper_trading
+
+signal:
+  model_config: configs/lightgbm_alpha158.yaml  # experiment whose predictions drive trading
+  max_prediction_age_days: 5                    # refuse to trade on stale signals
+
+broker:
+  provider: alpaca
+  mode: paper
+  allow_live_trading: false
+
+strategy:
+  topk: 10
+  n_drop: 2
+  rebalance_frequency: daily
+
+portfolio:
+  target_cash_ratio: 0.05      # keep ~5% cash reserve
+  max_position_weight: 0.15
+  min_trade_value: 200         # USD; skip dust orders below this
+  rebalance_tolerance: 0.02    # |current-target| weight below this => keep position untouched
+
+execution:
+  order_type: market
+  time_in_force: day
+  poll_interval_seconds: 2
+  poll_timeout_seconds: 120
+
+risk:
+  max_daily_turnover: 0.50     # sum(|order value|)/equity per run
+  max_single_order_weight: 0.15
+  max_total_exposure: 0.95
+  min_cash_ratio: 0.03
+  max_nan_ratio: 0.20          # abort if predictions are NaN-heavier than this
+
+logging:
+  dir: logs/paper_trading
