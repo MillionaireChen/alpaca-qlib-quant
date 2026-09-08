@@ -2,16 +2,106 @@
 
 # quant_project — NASDAQ 100 Quantitative Research & Paper-Trading System
 
-A reproducible quantitative research system built on Microsoft Qlib + Alpha158 +
-LightGBM + a transparent Top-K strategy, with real paper-trading execution
-through the Alpaca **Paper Trading** API. Paper trading is the default and only
-enabled execution mode — live endpoints are hard-blocked.
+An end-to-end, reproducible quantitative equity system: it learns a
+cross-sectional return-ranking model on NASDAQ-100 stocks, turns the ranking
+into a Top-K portfolio, measures it under realistic transaction costs, and then
+trades that same portfolio live against a simulated brokerage account through
+the Alpaca **Paper Trading** API.
+
+Paper trading is the default and only enabled execution mode — live endpoints
+are hard-blocked in code, not merely discouraged by convention.
+
+## What this project is
+
+Most "quant strategy" code stops at a backtest curve. The problem is that a
+backtest is the easiest thing in finance to accidentally fake: one misaligned
+label, one normalization fitted on future data, one zero-cost assumption, and
+an unprofitable idea looks excellent. This repository is built the other way
+round — **correctness and honest measurement come first, returns second**:
+
+* every result is produced by a committed script on real historical data, with
+  transaction costs, and is reproducible from a config snapshot;
+* the leakage traps are handled explicitly and documented (label alignment,
+  execution shift, chronological splits with an embargo, no future information
+  in normalization, point-in-time index membership);
+* the same strategy logic that is backtested is what the paper-trading layer
+  executes, so the two can be compared directly;
+* the trading layer treats operational safety as a higher priority than
+  performance — invalid signals refuse to trade, orders are validated before
+  submission, fills are never assumed, and the broker is always the source of
+  truth.
+
+It is a research and paper-trading platform, not a money-making promise. The
+measured edge (see [Verified results](#6-verified-results)) is real but thin and
+regime-dependent, and the README says so plainly.
+
+## What it does
+
+The full pipeline, all of it implemented and runnable:
 
 ```
-Market data → Feature engineering (Alpha158 + custom factors) → Dataset construction
-→ LightGBM training → Return prediction → Cross-sectional ranking → Top-K portfolio
-→ Cost-aware backtesting → Paper trading → Order / position / PnL monitoring & reconciliation
+Market data (daily OHLCV, adjusted, point-in-time universe)
+   ↓  scripts/prepare_data.py       — download + verify the qlib US bundle
+Feature engineering (Alpha158, 157 features, + 10 custom factors)
+   ↓  core/handlers.py, factors/    — qlib expressions & pandas twins, cross-verified
+Dataset construction (chronological splits, embargo, forward-return label)
+   ↓  core/handlers.py
+LightGBM training (early stopping on validation Rank IC)
+   ↓  scripts/train.py              — model + full reproducibility metadata
+Return prediction & signal quality analysis (daily IC / Rank IC / deciles)
+   ↓  scripts/predict.py
+Cross-sectional ranking → Top-K portfolio (equal weight, capped turnover)
+   ↓  strategies/topk.py
+Cost-aware backtest + performance report (9 metrics, 4 charts)
+   ↓  scripts/backtest.py
+Walk-forward evaluation (5 rolling windows, model retrained per window)
+   ↓  scripts/walk_forward.py
+Paper trading: target portfolio → diff orders → risk checks → Alpaca paper
+   ↓  scripts/paper_trade.py        — dry-run mode first, always
+Order / position / PnL monitoring, reconciliation, backtest-vs-paper comparison
+      scripts/account_status.py, reconcile.py, paper_vs_backtest.py
 ```
+
+Concretely, the repository contains: 9 CLI entry points, a broker-agnostic
+trading layer with an Alpaca adapter and an in-memory mock broker, 10 custom
+factors with pandas/qlib twin implementations, a pure-function metrics library,
+timestamped experiment tracking, and 61 unit tests covering factor correctness,
+no-look-ahead guarantees, metric math, and every trading-safety path.
+
+## How it works
+
+The design decisions that matter, and why:
+
+| Decision | Reason |
+|---|---|
+| Label `close[t+5]/close[t+1] − 1`, executed at t+1 close | The signal is formed after the close of t, so it can never be executed at a price already known when the features were computed |
+| Early stopping on validation **Rank IC**, not MSE | Stock selection is a ranking problem. With MSE the model stops at round 1 on this ~100-name cross-section (the signal sits below the L2 noise floor); Rank IC selects models with actual ordering power |
+| `embargo_days: 10` on train/valid segment ends | A 5-day forward label needs up to 6 future trading days; without the embargo, training labels would overlap the validation period |
+| Point-in-time `nasdaq100` membership | Using today's constituents for a 2016 backtest would bake in survivorship bias |
+| Costs always on (5 bps/side + $1 minimum) | A zero-cost backtest of a 0.40-turnover strategy is not a result, it is an artifact |
+| Walk-forward as the headline number | A single split invites period-specific overfitting; 5 retrained windows show how the edge behaves across regimes |
+| Orders from the target-vs-current **difference** | Rebuilding the portfolio daily would churn 100% of it; diffing touches only what changed |
+| Broker state authoritative, fills polled | Local expectations drift from reality (partial fills, rejections, stale orders); reconciliation surfaces the gap instead of hiding it |
+| Live trading blocked in code | A config typo should not be able to send real money anywhere |
+
+Everything a researcher would want to change — universe, benchmark, horizon,
+splits, model hyperparameters, K, turnover caps, costs, risk limits — lives in
+YAML under `configs/`, not in Python.
+
+## Project status
+
+Verified end-to-end on real data in this repository: data preparation, feature
+engineering, training, prediction/IC analysis, Top-K backtesting, performance
+reporting, custom factors, and walk-forward evaluation. The paper-trading layer
+(broker abstraction, order generation, risk controls, dry-run, execution,
+reconciliation, comparison) is implemented and verified against the mock
+broker; the one remaining step is the first **live paper session** against
+Alpaca, which must be run from your own machine — see
+[First milestone](#73-first-milestone-run-on-the-mac-in-order).
+
+Known limitation: the bundled dataset ends 2020-11, so live paper trading needs
+a data refresh first (top item on the [Roadmap](#12-roadmap)); until then the
+staleness guard deliberately refuses to trade.
 
 ---
 
