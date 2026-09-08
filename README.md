@@ -1,346 +1,415 @@
-# quant_project — NASDAQ 100 量化研究与纸面交易系统
-
-基于 Microsoft Qlib + Alpha158 + LightGBM + Top-K 策略的可复现量化研究系统,
-并通过 Alpaca **Paper Trading**(模拟账户)API 支持真实的纸面交易执行。
-默认且唯一开放的执行模式是纸面交易,实盘端点被硬性拦截。
-
-```
-市场数据 → 特征工程(Alpha158 + 自定义因子)→ 数据集构建 → LightGBM 训练
-→ 收益预测 → 截面排序 → Top-K 组合 → 含成本回测 → 纸面交易 → 订单/持仓/PnL 监控与对账
-```
-
----
-
-## 目录
-
-1. [系统要求与安装](#1-系统要求与安装)
-2. [快速开始](#2-快速开始)
-3. [数据说明](#3-数据说明)
-4. [研究方法与防泄漏设计](#4-研究方法与防泄漏设计)
-5. [配置详解](#5-配置详解)
-6. [已验证结果](#6-已验证结果)
-7. [纸面交易](#7-纸面交易)
-8. [目录结构与模块说明](#8-目录结构与模块说明)
-9. [实验追踪与复现](#9-实验追踪与复现)
-10. [测试](#10-测试)
-11. [常见问题](#11-常见问题)
-12. [未来扩展](#12-未来扩展)
-13. [免责声明](#13-免责声明)
-
----
-
-## 1. 系统要求与安装
-
-目标机器:Apple Silicon Mac mini(macOS,ARM64)。Linux x86_64 同样可运行(本仓库全部结果即在 Linux 上验证生成)。
-
-依赖管理只用 `uv`,不用 Conda,不直接使用系统 Python。
-
-```bash
-# 安装 uv(如未安装)
-brew install uv
-
-# 在仓库根目录按 uv.lock 精确复现环境(Python 3.11,pyqlib 0.9.7 提供 macOS universal2 原生 ARM64 轮子)
-uv sync
-```
-
-关键依赖版本(由 `uv.lock` 锁定):`pyqlib 0.9.7`、`lightgbm 4.7`、`pandas 2.3(<3)`、
-`numpy 2.4`、`alpaca-py 0.43`、`mlflow ≥3.15`(qlib 初始化需要,本项目自身不用它做追踪)。
-
-> 注:`pandas<3` 与 `mlflow>=2.9` 是刻意约束——pyqlib 对依赖上限声明不完整,
-> 放开会解析出 mlflow 1.27 + protobuf 7 的不兼容组合。
-
-## 2. 快速开始
-
-```bash
-# ① 数据:下载 qlib 官方美股日线包(约 450MB,解压后 1.3GB),含验证步骤
-uv run python scripts/prepare_data.py
-
-# ② 训练(Alpha158 → LightGBM,验证集 Rank-IC 早停)
-uv run python scripts/train.py --config configs/lightgbm_alpha158.yaml
-
-# ③ 预测 + IC 分析(测试段逐日 IC / Rank IC / 分层收益图)
-uv run python scripts/predict.py --config configs/lightgbm_alpha158.yaml
-
-# ④ Top-K 回测(含交易成本)+ 绩效报告
-uv run python scripts/backtest.py --config configs/lightgbm_alpha158.yaml
-
-# ⑤ Walk-forward 滚动窗口评估(5 窗口,逐窗重训)
-uv run python scripts/walk_forward.py --config configs/lightgbm_alpha158.yaml
-
-# ⑥ 纸面交易(先配密钥,见第 7 节;永远先 dry-run)
-uv run python scripts/paper_trade.py --config configs/paper_trading.yaml --dry-run
-uv run python scripts/paper_trade.py --config configs/paper_trading.yaml
-uv run python scripts/account_status.py --record
-uv run python scripts/reconcile.py
-uv run python scripts/paper_vs_backtest.py
-
-# ⑦ 单元测试(61 项)
-uv run pytest tests/ -q
-```
-
-所有实验输出进入 `results/<时间戳>_<实验名>/`,绝不覆盖历史实验;运行日志进入 `logs/`。
-
-## 3. 数据说明
-
-| 项目 | 说明 |
-|---|---|
-| 来源 | qlib 官方美股日线数据包(`scripts/prepare_data.py` 自动下载并验证) |
-| 覆盖 | **1999-12-31 → 2020-11-10**,日历 5250 个交易日 |
-| 字段 | open / high / low / close / volume / factor |
-| 复权 | **价格为拆股+分红复权价**(Yahoo 规范化),已用 AAPL 2020-08-31 拆股日验证无跳变;`$factor` 保留 |
-| 成分股 | `nasdaq100` 为**逐日时点成员**(个股按历史日期进出指数),显著降低——但不能完全消除——幸存者偏差 |
-| 基准 | `^ndx`(NASDAQ-100 指数,存储为归一化点位,收益率不受影响) |
-| VWAP | 数据包无 `$vwap` 字段,Alpha158 中唯一的 VWAP 特征被移除(剩 157 特征),见 `core/handlers.py` |
-
-**数据刷新**:数据止于 2020-11。刷新到当前需要外部行情源(推荐 Alpaca 行情 API,
-纸面交易密钥自带权限),把日线写入 qlib bin 格式即可无缝接入现有管线;这是第一优先的后续扩展。
-在刷新之前,纸面交易的信号过期保护(`signal.max_prediction_age_days`)会拒绝交易,
-只有显式传 `--ignore-staleness` 才能用旧信号做离线演练。
-
-## 4. 研究方法与防泄漏设计
-
-**标签**:`return[t] = close[t+5] / close[t+1] − 1`(t 日收盘后出信号,t+1 收盘价建仓,
-持有到 t+5 收盘)。horizon 通过 `label.horizon` 配置。
-
-**执行对齐(无未来函数)**:回测中 TopkDropoutStrategy 以 `shift=1` 取**前一交易日**的信号
-决定当日交易——已实证验证:回测首日持仓为 100% 现金(首日没有前一日信号)。
-特征在 t 日收盘数据上计算、t+1 日成交,与标签定义严格一致。
-
-**时间切分**:严格按时间顺序切分,绝不随机打乱。并加 `embargo_days: 10`:
-train/valid 段末端整体回退 10 天,使前视标签(需要未来 6 个交易日的收盘价)
-不会与下一段的时间区间重叠——训练标签不含验证期信息。
-
-**归一化**:标签归一化用 CSZScoreNorm(逐日截面 z-score,不跨时间,无未来信息);
-特征原样进 LightGBM(树模型天然处理 NaN 与量纲)。
-
-**早停指标**:验证集**日均 Rank IC**(而非 MSE)。截面选股关心的是排序质量;
-实测 MSE 早停在 ~100 只股票的高效市场截面上会在第 1 轮就停(信号弱于噪声的 L2 下界),
-Rank-IC 早停才能选出有排序能力的模型。
-
-**交易成本**:所有回测强制含成本(默认买卖各 5bp + 每笔最低 $1,`backtest.exchange` 可配),
-不报告任何零成本结果。
-
-**Walk-forward**:5 个滚动年度窗口(2016→2020),每窗**从零重训**,
-测试段严格样本外,窗口间无任何信息回流;共享特征 handler 是安全的
-(管线中不存在需要拟合统计量的 processor,全部为逐日截面运算)。
-
-## 5. 配置详解
-
-### configs/lightgbm_alpha158.yaml(研究)
-
-| 段 | 关键项 | 说明 |
-|---|---|---|
-| `experiment` | `name` / `seed` | 实验名(决定 results 目录后缀)与全局随机种子(42) |
-| `qlib` | `provider_uri` / `region` | 数据目录与市场区域(us) |
-| `universe` | `market: nasdaq100` / `benchmark: ^ndx` | 股票池与基准,均可替换(如 sp500) |
-| `data` | `start_time / end_time` | handler 数据窗(起点早于训练起点 1 年,预热 60 日滚动特征) |
-| `label` | `horizon: 5` | 预测期(交易日) |
-| `dataset` | `train / valid / test` + `embargo_days` | 时间切分与防重叠回退 |
-| `features` | `custom_factors: false` | true 时启用 Alpha158 + `factors/` 自定义因子(167 特征) |
-| `model` | `params` 等 | LightGBM 超参(为 ~100 只股票的窄截面调低:lr 0.05 / 64 叶 / 强正则) |
-| `strategy` | `topk: 10 / n_drop: 2` | 每日持有前 10 名,单日最多换 2 只(控制换手) |
-| `backtest` | `initial_capital` / `exchange.*` | 初始资金与成交价、双边成本、最低费用、交易单位 |
-| `walk_forward` | `windows` | 滚动窗口定义,逐窗训练/验证/测试区间 |
-
-### configs/paper_trading.yaml(纸面交易)
-
-| 段 | 关键项 | 说明 |
-|---|---|---|
-| `signal` | `model_config` / `max_prediction_age_days` | 信号来源实验 + 过期保护(默认 5 天) |
-| `broker` | `provider: alpaca / mode: paper / allow_live_trading: false` | **实盘硬拦截**:mode=live 且未显式开启覆盖时直接抛错,无自动降级/升级 |
-| `strategy` | `topk / n_drop / rebalance_frequency` | 与回测同构的 Top-K 参数 |
-| `portfolio` | `target_cash_ratio: 0.05` 等 | 现金保留、单仓上限 0.15、最小交易额 $200、再平衡容差 2% |
-| `execution` | `order_type: market / time_in_force: day` + 轮询参数 | 订单类型与成交状态轮询(间隔/超时) |
-| `risk` | 见第 7 节 | 全部风控阈值 |
-| `logging` | `dir` | 交易日志目录 |
-
-## 6. 已验证结果
-
-以下全部为本仓库代码在真实历史数据上运行的产物(seed 42,含成本),
-对应 `results/` 内的实验目录,任何人可按第 2 节命令复现。
-
-**基线单段**(训练 2008-2016,验证 2017-2018,测试 2019-01-02 → 2020-11-09,465 交易日):
-
-| 指标 | 数值 |
-|---|---|
-| 测试段日均 Rank IC / ICIR | 0.021 / 0.17(58% 天数为正) |
-| 组合净年化(含成本) | 62.4% |
-| 基准(NDX)年化 | 39.9% |
-| 净超额年化 | +15.4% |
-| 净 Sharpe | 1.72 |
-| 最大回撤 | −29.5%(2020-03 疫情崩盘) |
-| 日均换手 | 0.40 |
-
-**Walk-forward(5 窗口,严格样本外)**:
-
-| 窗口 | 测试期 | Rank IC | 净年化 | 基准年化 | Sharpe | 最大回撤 |
-|---|---|---|---|---|---|---|
-| 1 | 2016 | 0.023 | 15.7% | 5.9% | 0.78 | −15.3% |
-| 2 | 2017 | 0.007 | 24.1% | 31.7% | 1.72 | −6.4% |
-| 3 | 2018 | −0.003 | −7.4% | −1.0% | −0.23 | −18.2% |
-| 4 | 2019 | −0.002 | 27.1% | 38.0% | 1.34 | −15.2% |
-| 5 | 2020→11-10 | 0.059 | 66.0% | 42.3% | 1.35 | −35.3% |
-| **拼接** | 2016→2020-11 | — | **21.9%** | — | **0.89** | **−35.3%** |
-
-**诚实解读**:信号真实但薄、且依赖市场状态——高波动期(2020)最强,
-平静期(2018-2019)接近于零甚至为负。单段基线高估了 walk-forward 能支撑的水平,
-**以拼接结果为准**。这正是本系统坚持 walk-forward + 纸面交易验证、而不急于上实盘的原因。
-
-## 7. 纸面交易
-
-### 7.1 安全模型(优先级高于收益)
-
-* **实盘硬拦截**:`mode: paper` 为默认;`mode: live` 且 `allow_live_trading: false` 时
-  抛 `LiveTradingBlockedError`,不存在 paper↔live 自动切换。
-* **密钥**:仅从 `.env` 读取(`ALPACA_API_KEY` / `ALPACA_SECRET_KEY`),
-  已在 `.gitignore`,永不入日志、永不出现在报错信息里。
-* **信号熔断(DO NOT TRADE)**:预测为空 / NaN 超限 / 截面零方差 / 过期 → 拒绝交易,
-  记录原因,非零退出码。
-* **交易前校验**:单笔权重上限、日换手上限(空仓首次建仓豁免)、事后总敞口上限、
-  最低现金保留、购买力校验、重复挂单校验——任一违反,整批本地拒绝。
-* **最小化换手**:订单只来自目标组合与当前持仓的**差分**,不动的仓位绝不先卖后买;
-  卖单先于买单执行。
-* **成交不做假设**:每笔提交后轮询至终态(filled / canceled / rejected / expired),
-  超时未终态会在日志中警告并留给对账处理。
-* **防重复执行**:`client_order_id` 内嵌预测日期,同一 rebalance 重跑会被本地状态检查
-  (退出码 3)与券商端重复 ID 双重拒绝;`--force` 才能覆盖。
-* **对账以券商为准**:本地状态只是"期望",`reconcile.py` 检出缺失成交、部分成交、
-  拒单、意外持仓、现金偏差、过期挂单。
-
-### 7.2 密钥配置
-
-```bash
-cp .env.example .env
-# 编辑 .env,填入 https://app.alpaca.markets/paper/dashboard/overview 生成的 paper 密钥
-```
-
-### 7.3 首次里程碑(在 Mac 上按序执行)
-
-```text
-① uv run python scripts/account_status.py        # 验证 paper 端点(约 $100k 模拟资金)
-② uv run python scripts/paper_trade.py --config configs/paper_trading.yaml --dry-run
-   → 人工检查拟下订单(标的/方向/数量/金额)
-③ 同命令去掉 --dry-run,在美股盘中运行 → 观察提交与成交日志
-④ uv run python scripts/account_status.py --record   # 记录快照到 history.csv
-⑤ uv run python scripts/reconcile.py                 # 期望 "Reconciliation OK"
-```
-
-达成:模型出信号 → dry-run 出有效订单 → paper API 提交 → 券商确认成交
-→ 本地读回持仓 → 对账通过。
-
-### 7.4 日常运行与监控
-
-每个交易日:`paper_trade.py`(先 dry-run 后正式)→ `account_status.py --record` →
-`reconcile.py`。累计 ≥20 个快照后,`account_status.py --record` 自动输出纸面
-Sharpe / 回撤 / 波动 / 胜率;`paper_vs_backtest.py` 输出回测预期 vs 实际执行的对比
-(换手差、持仓重合率、成交率),用于判断策略是否经得起真实执行。
-所有运行记录(预测日期、目标权重、当前持仓、订单、券商订单 ID、成交状态、
-账户权益、错误)写入 `logs/paper_trading/run_*.json`,纸面绩效与历史回测绩效
-**分开存放,绝不混算**。
-
-## 8. 目录结构与模块说明
-
-```
-quant_project/
-├── configs/                  # 全部研究/交易参数(代码零硬编码)
-│   ├── lightgbm_alpha158.yaml
-│   └── paper_trading.yaml
-├── core/
-│   ├── config.py             # YAML 加载、日期规范化、嵌套键校验
-│   ├── log.py                # 控制台 + logs/ 文件双路日志
-│   ├── qlib_init.py          # qlib 初始化(区域/数据目录校验)
-│   ├── handlers.py           # Alpha158NoVWAP / +自定义因子 handler、标签表达式、embargo、数据集构建
-│   └── experiment.py         # 时间戳实验目录、配置快照、复现元数据
-├── factors/                  # 自定义因子:pandas 实现 + qlib 表达式双版本,已交叉验证一致
-│   ├── momentum.py           # 5/20/60 日动量、1 日反转
-│   ├── technical.py          # RSI、MACD(价格归一)、均线偏离
-│   ├── volatility.py         # 20 日已实现波动
-│   └── volume.py             # 量比
-├── models/
-│   └── lightgbm_model.py     # LightGBM 封装:Rank-IC 早停、fit/predict/save/load 统一接口
-├── strategies/
-│   └── topk.py               # Top-K(TopkDropout)策略构建
-├── backtests/
-│   ├── engine.py             # 回测引擎(成本、日历边界、持仓展平)
-│   ├── metrics.py            # 纯函数指标库 + IC 分析(可独立单测)
-│   ├── report.py             # 指标 JSON + 净值/超额/回撤/换手四图
-│   └── comparison.py         # 回测 vs 纸面对比
-├── trading/
-│   ├── broker.py             # 券商抽象接口与订单/持仓/账户数据类型
-│   ├── alpaca_paper.py       # Alpaca 适配器(paper 默认、live 拦截、最新价查询)
-│   ├── mock_broker.py        # 内存模拟券商(测试/离线演练;可配拒单、部分成交)
-│   ├── portfolio.py          # 目标组合(等权+现金保留+上限)与差分订单生成
-│   ├── risk.py               # 信号熔断 + 交易前全套风控校验
-│   ├── executor.py           # dry-run / 提交 + 状态轮询
-│   ├── reconciliation.py     # 对账(券商为准)
-│   └── state.py              # 运行记录、期望状态、绩效历史
-├── scripts/                  # 9 个 CLI 入口(见第 2 节)
-├── tests/                    # 61 项单测:因子、指标、标签、embargo、交易安全全覆盖
-├── results/                  # 实验产物(时间戳目录,永不覆盖)
-├── logs/                     # 运行与交易日志
-├── .env.example              # 密钥模板(.env 已被 git 忽略)
-├── pyproject.toml / uv.lock  # 环境完全锁定
-└── README.md / CLAUDE.md     # 本文档 / 项目工程规范
-```
-
-## 9. 实验追踪与复现
-
-每次 `train.py` 生成 `results/<时间戳>_<实验名>/`,内含:
-
-* `config_snapshot.yaml` — 当次配置完整快照
-* `experiment.json` — 训练/验证/测试区间、股票池、基准、特征集、预测期、
-  模型与策略参数、成本、随机种子、最优迭代、验证 Rank IC
-* `model.pkl` — 模型(含 booster 与特征名)
-* `pred_test.csv`、`ic_daily_test.csv`、`ic_summary_test.json`、IC/分布/分层三张图
-* `backtest/` — 日度报表、逐日持仓、指标 JSON、四张曲线图
-
-walk-forward 另生成 `_walkforward` 目录:逐窗产物 + `windows_summary.csv` +
-拼接段完整报告。给定相同数据与配置,任何人可完整复现任一结果。
-
-## 10. 测试
-
-```bash
-uv run pytest tests/ -q      # 61 passed
-```
-
-覆盖:因子手算值与无未来函数验证(逐因子截断对比)、指标手算值、IC 极端相关校验、
-标签表达式、embargo 边界、目标组合构建、差分订单(含"只换 NVDA→AMZN 不动 AAPL/MSFT"规范用例)、
-全部风控拒绝路径、dry-run 零提交、成交/拒单/部分成交处理、重复订单双重防护、
-实盘模式拦截、对账各类偏差检出。
-
-## 11. 常见问题
-
-**Q:回测报 `IndexError: index ... out of bounds`?**
-回测终点不能等于日历最后一天(qlib 需要"下一日"计算步长)。引擎已自动收缩终点,
-自定义调用 `run_backtest` 时无需处理。
-
-**Q:mlflow 报 file-store maintenance 错误?**
-mlflow ≥3.15 默认禁用文件后端;`core/qlib_init.py` 已自动设置
-`MLFLOW_ALLOW_FILE_STORE=true`(本项目不用 mlflow 追踪)。
-
-**Q:纸面交易报 "prediction date ... is N days old"?**
-信号过期保护在起作用。正式运行请先刷新数据重训;离线演练加 `--ignore-staleness`。
-
-**Q:`paper_trade.py` 退出码 2 / 3 是什么?**
-2 = 风控拒绝(原因已写日志与运行记录);3 = 该预测日期的 rebalance 已执行过(防重复)。
-
-**Q:Apple Silicon 安装失败?**
-确认 `uv sync`(而非手动 pip);pyqlib 0.9.7 有 universal2 轮子,无需编译。
-若个别包报错,先看真实报错信息,不要更换包管理器。
-
-**Q:想换股票池?**
-改 `universe.market`(数据包内置 `sp500` 等 instruments 文件)与 `universe.benchmark`,
-其余零改动。
-
-## 12. 未来扩展
-
-按优先级:① Alpaca→qlib 数据刷新脚本(打通"最新数据→当日信号→当日纸面下单");
-② `features.custom_factors: true` 分支的完整对照实验;③ 更多模型
-(XGBoost/MLP/LSTM/Transformer)——接口已按 `models/lightgbm_model.py` 约定预留;
-④ 组合权重优化(基线刻意保持等权);⑤ 强化学习仅考虑用于仓位/执行层,
-且必须在监督基线经纸面验证之后。
-
-## 13. 免责声明
-
-本仓库仅用于量化研究与模拟(纸面)交易。历史回测与模拟成交均不构成对未来收益的
-承诺,不构成任何投资建议。切勿在未充分验证前将本系统连接真实资金账户。
+## Configurations
+We summarize all the customizable configurations:
+- [config.py](#config)
+- [cfg_data.py](#data)
+- [cfg_model.py](#model)
+- [cfg_fl_algo.py](#federated-algorithms)
+- [cfg_training.py](#federated-training)
+- [cfg_fl_setting.py](#fl-setting)
+- [cfg_evaluation.py](#evaluation)
+- [cfg_asyn.py](#asynchronous-training-strategies)
+- [cfg_differential_privacy.py](#differential-privacy)
+- [cfg_hpo.py](#auto-tuning-components)
+- [cfg_attack.py](#attack)
+
+### config
+The configurations related to environment of running experiment.
+
+| Name                   | (Type) Default Value | Description                                                  | Note |
+| ---------------------- | -------------------- | ------------------------------------------------------------ | ---- |
+| `backend`              | (string) 'torch'     | The backend for local training                               | -    |
+| `use_gpu`              | (bool) False         | Whether to use GPU                                           | -    |
+| `check_completeness`   | (bool) False         | Whether to check the completeness of msg_handler             | -    |
+| `verbose`              | (int) 1              | Whether to print verbose logging info                        | -    |
+| `print_decimal_digits` | (int) 6              | How many decimal places we print out using logger            | -    |
+| `device`               | (int) -1             | Specify the device for training                              | -    |
+| `seed`                 | (int) 0              | Random seed                                                  | -    |
+| `outdir`               | (string) ''          | The dir used to save log, exp_config, models, etc,.          | -    |
+| `expname`              | (string) ''          | Detailed exp name to distinguish different sub-exp           | -    |
+| `expname_tag`          | (string) ''          | Detailed exp tag to distinguish different sub-exp with the same expname | -    |
+
+
+### Data
+The configurations related to the data/dataset are defined in `cfg_data.py`.
+
+|                     Name                     |  (Type) Default Value | Description | Note                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
+|:--------------------------------------------:|:-----:|:---------- |:--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+|                 `data.root`                  | (string) 'data' | The folder where the data file located. `data.root` would be used together with `data.type` to load the dataset. | -                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+|                 `data.type`                  | (string) 'toy' | Dataset name | CV: 'femnist', 'celeba' ; NLP: 'shakespeare', 'subreddit', 'twitter'; Graph: 'cora', 'citeseer', 'pubmed', 'dblp_conf', 'dblp_org', 'csbm', 'epinions', 'ciao', 'fb15k-237', 'wn18', 'fb15k' , 'MUTAG', 'BZR', 'COX2', 'DHFR', 'PTC_MR', 'AIDS', 'NCI1', 'ENZYMES', 'DD', 'PROTEINS', 'COLLAB', 'IMDB-BINARY', 'IMDB-MULTI', 'REDDIT-BINARY', 'IMDB-BINARY', 'IMDB-MULTI', 'HIV', 'ESOL', 'FREESOLV', 'LIPO', 'PCBA', 'MUV', 'BACE', 'BBBP', 'TOX21', 'TOXCAST', 'SIDER', 'CLINTOX', 'graph_multi_domain_mol', 'graph_multi_domain_small', 'graph_multi_domain_mix', 'graph_multi_domain_biochem'; MF: 'vflmovielens1m', 'vflmovielens10m', 'hflmovielens1m', 'hflmovielens10m', 'vflnetflix', 'hflnetflix'; Tabular: 'toy', 'synthetic'; External dataset: 'DNAME@torchvision', 'DNAME@torchtext', 'DNAME@huggingface_datasets', 'DNAME@openml'. |
+|               `data.file_path`               | (string) '' | The path to the data file, only makes effect when data.type = 'file' | - |
+|                 `data.args`                  | (list) [] | Args for the external dataset | Used for external dataset, eg. `[{'download': False}]`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
+|               `data.save_data`               | (bool) False | Whether to save the generated toy data | -                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+|               `data.splitter`                | (string) '' | Splitter name for standalone dataset | Generic splitter: 'lda'; Graph splitter: 'louvain', 'random', 'rel_type', 'graph_type', 'scaffold', 'scaffold_lda', 'rand_chunk'                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
+|             `data.splitter_args`             | (list) [] | Args for splitter. | Used for splitter, eg. `[{'alpha': 0.5}]`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+|               `data.transform`               | (list) [] | Transform for x of data | Used in `get_item` in torch.dataset, eg. `[['ToTensor'], ['Normalize', {'mean': [0.9637], 'std': [0.1592]}]]`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+|           `data.target_transform`            | (list) [] | Transform for y of data | Use as `data.transform`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+|             `data.pre_transform`             | (list) [] | Pre_transform for `torch_geometric` dataset | Use as `data.transform`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+|           `dataloader.batch_size`            | (int) 64 | batch_size for DataLoader | -                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+|            `dataloader.drop_last`            | (bool) False | Whether drop last batch (if the number of last batch is smaller than batch_size) in DataLoader | -                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+|              `dataloader.sizes`              | (list) [10, 5] | Sample size for graph DataLoader | The length of `dataloader.sizes` must meet the layer of GNN models.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
+|             `dataloader.shuffle`             | (bool) True | Shuffle train DataLoader | -                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+|           `data.server_holds_all`            | (bool) False | Only use in global mode, whether the server (workers with idx 0) holds all data, useful in global training/evaluation case | -                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+|               `data.subsample`               | (float) 1.0 |  Only used in LEAF datasets, subsample clients from all clients | -                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+|                `data.splits`                 | (list) [0.8, 0.1, 0.1] | Train, valid, test splits | -                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| `data.` </br>`consistent_label_distribution` | (bool) True | Make label distribution of train/val/test set over clients keep consistent during splitting | -                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+|               `data.cSBM_phi`                | (list) [0.5, 0.5, 0.5] | Phi for cSBM graph dataset | -                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+|                `data.loader`                 | (string) '' | Graph sample name, used in minibatch trainer | 'graphsaint-rw': use `GraphSAINTRandomWalkSampler` as DataLoader; 'neighbor': use `NeighborSampler` as DataLoader.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
+|           `dataloader.num_workers`           | (int) 0 | num_workers in DataLoader | -                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+|           `dataloader.walk_length`           | (int) 2 | The length of each random walk in graphsaint. | -                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+|            `dataloader.num_steps`            | (int) 30 | The number of iterations per epoch in graphsaint. | -                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+|             `data.quadratic.dim`             | (int) 1 | Dim of synthetic quadratic  dataset | -                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+|          `data.quadratic.min_curv`           | (float) 0.02 | Min_curve of synthetic quadratic  dataset | -                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+|          `data.quadratic.max_curv`           | (float) 12.5 | Max_cur of synthetic quadratic  dataset | -                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+
+
+### Model
+
+The configurations related to the model are defined in `cfg_model.py`.  
+| [General](#model-general) | [Criterion](#criterion) | [Regularization](#regularizer) | 
+
+#### Model-General
+|            Name            | (Type) Default Value |                   Description                    |                                                                                          Note                                                                                          |
+|:--------------------------:|:--------------------:|:------------------------------------------------:|:--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------:|
+| `model.`</br> `model_num_per_trainer` |     (int) 1     | Number of model per trainer |                                                                 some methods may leverage more                                                                 |
+| `model.type` | (string) 'lr' | The model name used in FL | CV: 'convnet2', 'convnet5', 'vgg11', 'lr'; NLP: 'LSTM', 'MODEL@transformers'; Graph:  'gcn', 'sage', 'gpr', 'gat', 'gin', 'mpnn';  Tabular: 'mlp', 'lr', 'quadratic'; MF: 'vmfnet', 'hmfnet' |
+| `model.use_bias` | (bool) True | Whether use bias in lr model | - |
+| `model.task` | (string) 'node' | The task type of model, the default is `Classification` | NLP: 'PreTraining', 'QuestionAnswering', 'SequenceClassification', 'TokenClassification', 'Auto', 'WithLMHead'; Graph: 'NodeClassification', 'NodeRegression', 'LinkClassification', 'LinkRegression', 'GraphClassification', 'GraphRegression', |
+| `model.hidden` | (int) 256 | Hidden layer dimension | - |
+| `model.dropout` | (float) 0.5 | Dropout ratio | - |
+| `model.in_channels` | (int) 0 | Input channels dimension | If 0, model will be built by `data.shape` |
+| `model.out_channels` | (int) 1 | Output channels dimension | - |
+| `model.layer` | (int) 2 | Model layer | - |
+| `model.graph_pooling` | (string) 'mean' | Graph pooling method in graph-level task | 'add', 'mean' or 'max' |
+| `model.embed_size` | (int) 8 | `embed_size` in LSTM | - |
+| `model.num_item` | (int) 0 | Number of items in MF. | It will be overwritten by the real value of the dataset. |
+| `model.num_user` | (int) 0 | Number of users in MF. | It will be overwritten by the real value of the dataset. |
+
+#### Criterion
+
+|            Name            | (Type) Default Value |                   Description                    |                                                                                         Note                                                                                          |
+|:--------------------------:|:--------------------:|:------------------------------------------------:|:-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------:|
+| `criterion.type` |     (string) 'MSELoss'     | Criterion type |                                                                                           Chosen from https://pytorch.org/docs/stable/nn.html#loss-functions , eg. 'CrossEntropyLoss', 'L1Loss', etc.                                                                                            |
+
+#### Regularizer
+
+|            Name            | (Type) Default Value |                   Description                    |                                                                                          Note                                                                                          |
+|:--------------------------:|:--------------------:|:------------------------------------------------:|:--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------:|
+| `regularizer.type` |     (string) ' '     | The type of the regularizer |                                                                 Chosen from [`proximal_regularizer`]                                                                 |
+| `regularizer.mu` | (float) 0 | The factor that controls the loss of the regularization term | - |
+
+
+### Federated Algorithms 
+The configurations related to specific federated algorithms, which are defined in `cfg_fl_algo.py`.
+
+| [FedOPT](#fedopt-for-fedopt-algorithm) | [FedProx](#fedprox-for-fedprox-algorithm) | [personalization](#personalization-for-personalization-algorithms) | [fedsageplus](#fedsageplus-for-fedsageplus-algorithm) | [gcflplus](#gcflplus-for-gcflplus-algorithm) | [flitplus](#flitplus-for-flitplus-algorithm) |
+
+#### `fedopt`: for FedOpt algorithm
+| Name |  (Type) Default Value | Description | Note |
+|:----:|:-----:|:---------- |:---- |
+| `fedopt.use` | (bool) False | Whether to run FL courses with FedOpt algorithm. | If False, all the related configurations (cfg.fedopt.xxx) would not take effect. |
+| `fedopt.optimizer.type` | (string) 'SGD' | The type of optimizer used for FedOpt algorithm. | Currently we support all optimizers build in PyTorch (The modules under torch.optim). |
+| `fedopt.optimizer.lr` | (float) 0.1 | The learning rate used in for FedOpt optimizer. | - |
+#### `fedprox`: for FedProx algorithm 
+| Name |  (Type) Default Value | Description | Note |
+|:----:|:-----:|:---------- |:---- |
+| `fedprox.use` | (bool) False | Whether to run FL courses with FedProx algorithm. | If False, all the related configurations (cfg.fedprox.xxx) would not take effect. |
+| `fedprox.mu` | (float) 0.0 | The hyper-parameter $\mu$ used in FedProx algorithm. | - |
+#### `personalization`: for personalization algorithms
+| Name |  (Type) Default Value | Description | Note |
+|:----:|:-----:|:---------- |:---- |
+| `personalization.local_param` | (list of str) [] | The client-distinct local param names, e.g., ['pre', 'bn'] | - |
+| `personalization.`</br> `share_non_trainable_para` | (bool) False | Whether transmit non-trainable parameters between FL participants | - |
+| `personalization.`</br> `local_update_steps` | (int) -1 | The local training steps for personalized models | By default, -1 indicates that the local model steps will be set to be the same as the valid `train.local_update_steps` |
+| `personalization.regular_weight` | (float) 0.1 | The regularization factor used for model para regularization methods such as Ditto and pFedMe. | The smaller the regular_weight is, the stronger emphasising on personalized model. |
+| `personalization.lr` | (float) 0.0 | The personalized learning rate used in personalized FL algorithms. | The default value 0.0 indicates that the value will be set to be the same as `train.optimizer.lr` in case of users have not specify a valid `personalization.lr` |
+| `personalization.K` | (int) 5 | The local approximation steps for pFedMe. | - |
+| `personalization.beta` | (float) 5 | The average moving parameter for pFedMe. | - |
+#### `fedsageplus`: for fedsageplus algorithm
+| Name |  (Type) Default Value | Description | Note |
+|:----:|:-----:|:---------- |:---- |
+| `fedsageplus.num_pred` | (int) 5 | Number of nodes generated by the generator | - |
+| `fedsageplus.gen_hidden` | (int) 128 | Hidden layer dimension of generator | - |
+| `fedsageplus.hide_portion` | (float) 0.5 | Hide graph portion | - |
+| `fedsageplus.fedgen_epoch` | (int) 200 | Federated training round for generator | - |
+| `fedsageplus.loc_epoch` | (int) 1 | Local pre-train round for generator | - |
+| `fedsageplus.a` | (float) 1.0 | Coefficient for criterion number of missing node | - |
+| `fedsageplus.b` | (float) 1.0 | Coefficient for criterion feature | - |
+| `fedsageplus.c` | (float) 1.0 | Coefficient for criterion classification | - |
+#### `gcflplus`: for gcflplus algorithm
+| Name |  (Type) Default Value | Description | Note |
+|:----:|:-----:|:---------- |:---- |
+| `gcflplus.EPS_1` | (float) 0.05 | Bound for mean_norm | - |
+| `gcflplus.EPS_2` | (float) 0.1 | Bound for max_norm | - |
+| `gcflplus.seq_length` | (int) 5 | Length of the gradient sequence | - |
+| `gcflplus.standardize` | (bool) False | Whether standardized dtw_distances | - |
+#### `flitplus`: for flitplus algorithm
+| Name |  (Type) Default Value | Description | Note |
+|:----:|:-----:|:---------- |:---- |
+| `flitplus.tmpFed` | (float) 0.5 |  gamma in focal loss (Eq.4) | - |
+| `flitplus.lambdavat` | (float) 0.5 | lambda in phi (Eq.10) | - |
+| `flitplus.factor_ema` | (float) 0.8 | beta in omega (Eq.12) | - |
+| `flitplus.weightReg` | (float) 1.0 | balance lossLocalLabel and lossLocalVAT | - |
+
+
+### Federated training
+The configurations related to federated training are defined in `cfg_training.py`.
+Considering it's infeasible to list all the potential arguments for optimizers and schedulers, we allow the users to add new parameters directly under the corresponding namespace. 
+For example, we haven't defined the argument `train.optimizer.weight_decay` in `cfg_training.py`, but the users are allowed directly use it. 
+If the optimizer doesn't require the argument named `weight_decay`, an error will be raised. 
+
+| [Local Training](#local-training) | [Finetune](#fine-tuning) | [Grad Clipping](#grad-clipping) | [Early Stop](#early-stop) | 
+
+#### Local training
+The following configurations are related to the local training. 
+
+|            Name            | (Type) Default Value |                   Description                    |                                                                                         Note                                                                                         |
+|:--------------------------:|:--------------------:|:------------------------------------------------:|:------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------:|
+| `train.local_update_steps` |       (int) 1        |       The number of local training steps.        |                                                                                          -                                                                                           |
+|   `train.batch_or_epoch`   |   (string) 'batch'   |           The type of local training.            |               `train.batch_or_epoch` specifies the unit that `train.local_update_steps` adopts. All new parameters will be used as arguments for the chosen optimizer.               |
+|     `train.optimizer`      |          -           |                        -                         |                     You can add new parameters under `train.optimizer` according to the optimizer, e.g., you can set momentum by `cfg.train.optimizer.momentum`.                     |
+|   `train.optimizer.type`   |    (string) 'SGD'    |  The type of optimizer used in local training.   |                                               Currently we support all optimizers build in PyTorch (The modules under `torch.optim`).                                                |
+| `train.optimizer.lr` |     (float) 0.1      |  The learning rate used in the local training.   |                                                                                          -                                                                                           |
+|     `train.scheduler`      |          -           |                        -                         | Similar with `train.optimizer`, you can add new parameters as you need, e.g., `train.scheduler.step_size=10`. All new parameters will be used as arguments for the chosen scheduler. |
+| `train.scheduler.type` |     (string) ''      | The type of the scheduler used in local training |                                         Currently we support all schedulers build in PyTorch (The modules under `torch.optim.lr_scheduler`).                                         |
+
+#### Fine tuning
+The following configurations are related to the fine tuning.
+
+|            Name            | (Type) Default Value |                   Description                    |                                                                                          Note                                                                                          |
+|:--------------------------:|:--------------------:|:------------------------------------------------:|:--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------:|
+| `finetune.before_eval` |     (bool) False     |      Indicator of fintune before evaluation      | If `True`, the clients will fine tune its model before each evaluation. Note the fine tuning is only conducted before evaluation and won't influence the upload weights in each round. |
+| `finetune.local_update_steps` |       (int) 1        |       The number of local fine tune steps        |                                                                                           -                                                                                            |
+| `finetune.batch_or_epoch` |   (string) `batch`   |          The type of local fine tuning.          |                                   Similar with `train.batch_or_epoch`, `finetune.batch_or_epoch` specifies the unit of `finetune.local_update_steps`                                   |
+| `finetune.optimizer` |          -           |                        -                         |            You can add new parameters under `finetune.optimizer` according to the type of optimizer. All new parameters will be used as arguments for the chosen optimizer.            |
+| `finetune.optimizer.type` |    (string) 'SGD'    |  The type of the optimizer used in fine tuning.  |                                                Currently we support all optimizers build in PyTorch (The modules under `torch.optim`).                                                 |
+| `finetune.optimizer.lr` |     (float) 0.1      |   The learning rate used in local fine tuning    |                                                                                           -                                                                                            |
+| `finetune.scheduler` |          -           | - |                   Similar with `train.scheduler`, you can add new parameters as you need, and all new parameters will be used as arguments for the chosen scheduler.                   |
+
+#### Grad Clipping
+The following configurations are related to the grad clipping.  
+
+|            Name            | (Type) Default Value |                   Description                    |                                                                                          Note                                                                                          |
+|:--------------------------:|:--------------------:|:------------------------------------------------:|:--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------:|
+| `grad.grad_clip` |     (float) -1.0     | The threshold used in gradient clipping. |                                                                 `grad.grad_clip < 0` means we don't clip the gradient.                                                                 |
+
+#### Early Stop
+
+|                   Name                   | (Type) Default Value |                   Description                    |                                                                                         Note                                                                                          |
+|:----------------------------------------:|:--------------------:|:------------------------------------------------:|:-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------:|
+|          `early_stop.patience`           | (int) 5 |  How long to wait after last time the monitored metric improved. |                        Note that the actual_checking_round = `early_step.patience` * `eval.freq`. To disable the early stop, set the `early_stop.patience` <=0                        |
+|            `early_stop.delta`            | (float) 0. |  Minimum change in the monitored metric to indicate a improvement. |                                                                                           -                                                                                           |
+|   `early_stop.improve_indicaator_mode`   | (string) 'best' | Early stop when there is no improvement within the last `early_step.patience` rounds, in ['mean', 'best'] |                                                                             Chosen from 'mean' or 'best'                                                                              |
+
+
+### FL Setting
+The configurations related to FL settings are defined in `cfg_fl_setting.py`.
+
+| [General](#federate-general-fl-setting) | [Distribute](#distribute-for-distribute-mode) | [Vertical](#vertical-for-vertical-federated-learning) | 
+
+#### `federate`: general fl setting
+| Name |  (Type) Default Value |  Description  | Note |
+|:----:|:-----:|:---------- |:---- |
+| `federate.client_num` | (int) 0 | The number of clients that involves in the FL courses. | It can set to 0 to automatically specify by the partition of dataset. |
+| `federate.sample_client_num` | (int) -1 | The number of sampled clients in each training round. | - |
+| `federate.sample_client_rate` | (float) -1.0 | The ratio of sampled clients in each training round. | - |
+| `federate.unseen_clients_rate` | (float) 0.0 | The ratio of clients served as unseen clients, which would not be used for training and only for evaluation. | - |
+| `federate.total_round_num` | (int) 50 | The maximum training round number of the FL course. | - |
+| `federate.mode` | (string) 'standalone' </br> Choices: {'standalone', 'distributed'} | The running mode of the FL course. | - |
+| `federate.share_local_model` | (bool) False | If `True`, only one model object is created in the FL course and shared among clients for efficient simulation. | - | 
+| `federate.data_weighted_aggr` | (bool) False | If `True`, the weight of aggregator is the number of training samples in dataset. | - |
+| `federate.online_aggr` | (bool) False | If `True`, an online aggregation mechanism would be applied for efficient simulation. | - | 
+| `federate.make_global_eval` | (bool) False | If `True`, the evaluation would be performed on the server's test data, otherwise each client would perform evaluation on local test set and the results would be merged. | - |
+| `federate.use_diff` | (bool) False | If `True`, the clients would return the variation in local training (i.e., $\delta$) instead of the updated models to the server for federated aggregation. | - | 
+| `federate.merge_test_data` | (bool) False | If `True`, clients' test data would be merged and perform global evaluation for efficient simulation. | - |
+| `federate.method` | (string) 'FedAvg' | The method used for federated aggregation. | We support existing federated aggregation algorithms (such as 'FedAvg/FedOpt'), 'global' (centralized training), 'local' (isolated training), personalized algorithms ('Ditto/pFedMe/FedEM'), and allow developer to customize. | 
+| `federate.ignore_weight` | (bool) False | If `True`, the model updates would be averaged in federated aggregation. | - |
+| `federate.use_ss` | (bool) False | If `True`, additively secret sharing would be applied in the FL course. | Only used in vanilla FedAvg in this version. | 
+| `federate.restore_from` | (string) '' | The checkpoint file to restore the model. | - |
+| `federate.save_to` | (string) '' | The path to save the model. | - | 
+| `federate.join_in_info` | (list of string) [] | The information requirements (from server) for joining in the FL course. | We support 'num_sample/client_resource' and allow user customization.
+| `federate.sampler` | (string) 'uniform' </br> Choices: {'uniform', 'group'} | The sample strategy of server used for client selection in a training round. | - |
+| `federate.` </br>`resource_info_file` | (string) '' | the device information file to record computation and communication ability | - | 
+| `federate.process_num` | (int) 1 | The number of parallel processes. It only takes effect when `use_gpu=True`, `backend='torch'`, `federate.mode='standalone'` and `federate.share_local_model=False`, and the value is required to be not greater than the number of GPUs. | - |
+#### `distribute`: for distribute mode
+| Name |  (Type) Default Value |  Description  | Note |
+|:----:|:-----:|:---------- |:---- |
+| `distribute.use` | (bool) False | Whether to run FL courses with distribute mode. | If `False`, all the related configurations (`cfg.distribute.xxx`) would not take effect.  |
+| `distribute.server_host` | (string) '0.0.0.0' | The host of server's ip address for communication | - |
+| `distribute.server_port` | (string) 50050 | The port of server's ip address for communication | - |
+| `distribute.client_host` | (string) '0.0.0.0' | The host of client's ip address for communication | - |
+| `distribute.client_port` | (string) 50050 | The port of client's ip address for communication | - |
+| `distribute.role` | (string) 'client' </br> Choices: {'server', 'client'} | The role of the worker | - |
+| `distribute.data_idx` | (int) -1 | It is used to specify the data index in distributed mode when adopting a centralized dataset for simulation (formatted as {data_idx: data/dataloader}). | `data_idx=-1` means that the entire dataset is owned by the participant. And we randomly sample the index in simulation for other invalid values excepted for -1.
+| `distribute.` </br>`grpc_max_send_message_length` | (int) 100 * 1024 * 1024 | The maximum length of sent messages | - |
+| `distribute.` </br>`grpc_max_receive_message_length` | (int) 100 * 1024 * 1024 | The maximum length of received messages | - |
+| `distribute.grpc_enable_http_proxy` | (bool) False | Whether to enable http proxy | - |
+#### `vertical`: for vertical federated learning
+| Name |  (Type) Default Value |  Description  | Note |
+|:----:|:-----:|:---------- |:---- |
+| `vertical.use` | (bool) False | Whether to run vertical FL. | If `False`, all the related configurations (`cfg.vertical.xxx`) would not take effect.  |
+| `vertical.encryption` | (string) `paillier` | The encryption algorithms used in vertical FL. | - |
+| `vertical.dims` | (list of int) [5,10] | The dimensions of the input features for participants. | - |
+| `vertical.key_size` | (int) 3072 | The length (bit) of the public keys. | - | 
+
+
+### Evaluation
+The configurations related to monitoring and evaluation, which are adefined in `cfg_evaluation.py`.
+
+| [General](#evaluation-general) | [WandB](#wandb-for-wandb-tracking-and-visualization) |
+
+#### Evaluation General
+| Name |  (Type) Default Value | Description | Note |
+|:----:|:-----:|:---------- |:---- |
+| `eval.freq` | (int) 1 | The frequency we conduct evaluation. | - |
+| `eval.metrics` | (list of str) [] | The names of adopted evaluation metrics. | By default, we calculate the ['loss', 'avg_loss', 'total'], all the supported metric can be find in `core/monitors/metric_calculator.py` |
+| `eval.split` | (list of str) ['test', 'val'] | The data splits' names we conduct evaluation. | - |
+| `eval.report` | (list of str) ['weighted_avg', 'avg', 'fairness', 'raw'] | The results reported forms to loggers | By default, we report comprehensive results, - `weighted_avg` and `avg` indicate the weighted average and uniform average over all evaluated clients; - `fairness` indicates report fairness-related results such as individual performance and std across all evaluated clients; - `raw` indicates that we save and compress all clients' individual results without summarization, and users can flexibly post-process the saved results further.|
+| `eval.`</br> `best_res_update_round_wise_key` | (str) 'val_loss' | The metric name we used to as the primary key to check the performance improvement at each evaluation round. | - |
+| `eval.monitoring` | (list of str) [] | Extended monitoring methods or metric, e.g., 'dissim' for B-local dissimilarity | - |
+| `eval.count_flops` | (bool) True | Whether to count the flops during the FL courses. | - |
+#### `wandb`: for wandb tracking and visualization
+| Name |  (Type) Default Value | Description | Note |
+|:----:|:-----:|:---------- |:---- |
+| `wandb.use` | (bool) False | Whether to use wandb to track and visualize the FL dynamics and results. | If `False`, all the related configurations (`wandb.xxx`) would not take effect. |
+| `wandb.name_user` | (str) '' | the user name used in wandb management | - |
+| `wandb.name_project` | (str) '' | the project name used in wandb management | - |
+| `wandb.online_track` | (bool) True | whether to track the results in an online manner, i.e., log results at every evaluation round | - |
+| `wandb.client_train_info` | (bool) True | whether to track the training info of clients | - |
+
+
+### Asynchronous Training Strategies
+The configurations related to applying asynchronous training strategies in FL are defined in `cfg_asyn.py`.
+
+| Name |  (Type) Default Value |  Description  | Note |
+|:----:|:-----:|:---------- |:---- |
+| `asyn.use` | (bool) False | Whether to use asynchronous training strategies. | If `False`, all the related configurations (`cfg.asyn.xxx`) would not take effect.  |
+| `asyn.time_budget` | (int/float) 0 | The predefined time budget (seconds) for each training round. | `time_budget`<=0 means the time budget is not applied. |
+| `asyn.min_received_num` | (int) 2 | The minimal number of received feedback for the server to trigger federated aggregation. | - |
+| `asyn.min_received_rate` | (float) -1.0 | The minimal ratio of received feedback w.r.t. the sampled clients for the server to trigger federated aggregation. | - |
+| `asyn.staleness_toleration` | (int) 0 | The threshold of the tolerable staleness in federated aggregation. | - | 
+| `asyn.` </br>`staleness_discount_factor` | (float) 1.0 | The discount factor for the staled feedback in federated aggregation. | - |
+| `asyn.aggregator` | (string) 'goal_achieved' </br> Choices: {'goal_achieved', 'time_up'} | The condition for federated aggregation. | 'goal_achieved': perform aggregation when the defined number of feedback has been received; 'time_up': perform aggregation when the allocated time budget has been run out. |
+| `asyn.broadcast_manner` | (string) 'after_aggregating' </br> Choices: {'after_aggregating', 'after_receiving'} | The broadcasting manner of server. | 'after_aggregating': broadcast the up-to-date global model after performing federated aggregation; 'after_receiving': broadcast the up-to-date global model after receiving the model update from clients. |
+| `asyn.overselection` | (bool) False | Whether to use the overselection technique | - |
+
+
+### Differential Privacy
+| [NbAFL](#nbafl) | [SGDMF](#sgdmf) | 
+
+#### NbAFL
+The configurations related to NbAFL method. 
+
+| Name | (Type) Default Value | Description                                | Note |
+|:----:|:--------------------:|:-------------------------------------------|:-----|
+| `nbafl.use` |     (bool) False     | The indicator of the NbAFL method.         | - |
+| `nbafl.mu` |      (float) 0.      | The argument $\mu$ in NbAFL.               | - | 
+| `nbafl.epsilon` |     (float) 100.     | The $\epsilon$-DP guarantee used in NbAFL. | - |
+| `nbafl.w_clip` |      (float) 1.      | The threshold used for weight clipping.    | - |
+| `nbafl.constant` |     (float) 30. | The constant used in NbAFL.                | - |
+
+#### SGDMF
+The configurations related to SGDMF method (only used in matrix factorization tasks).
+
+|        Name        | (Type) Default Value | Description                        | Note                                                    |
+|:------------------:|:--------------------:|:-----------------------------------|:--------------------------------------------------------|
+|    `sgdmf.use`     |     (bool) False     | The indicator of the SGDMF method. |                                                         |
+|     `sgdmf.R`      |      (float) 5.      | The upper bound of rating.         | -                                                       |
+|  `sgdmf.epsilon`   |      (float) 4.      | The $\epsilon$ used in DP.         | -                                                       |
+|   `sgdmf.delta`    |     (float) 0.5      | The $\delta$ used in DP.           | -                                                       |
+|  `sgdmf.constant`  |      (float) 1. | The constant in SGDMF | -                                                       |
+| `dagaloader.theta` | (int) -1 | - | -1 means per-rating privacy, otherwise per-user privacy |
+
+
+### Auto-tuning Components
+
+These arguments are exposed for customizing our provided auto-tuning components.
+
+| [General](#auto-tunning-general) | [SHA](#successive-halving-algorithm-sha) | [FedEx](#fedex) | [Wrappers for FedEx](#wrappers-for-fedex) | 
+
+#### Auto-tunning General
+
+| Name | (Type) Default Value | Description                                | Note |
+|:----:|:--------------------:|:-------------------------------------------|:-----|
+| `hpo.working_folder` |     (string) 'hpo'     | Save model checkpoints and search space configurations to this folder.         | Trials in the next stage of an iterative HPO algorithm can restore from the checkpoints of their corresponding last trials. |
+| `hpo.ss` |     (string) 'hpo'     | File path of the .yaml that specifying the search space.         | - |
+| `hpo.num_workers` |     (int) 0     | The number of threads to concurrently attempt different hyperparameter configurations.         | Multi-threading is banned in current version. |
+| `hpo.init_cand_num` |     (int) 16     | The number of initial hyperparameter configurations sampled from the search space.         | - |
+| `hpo.larger_better` |     (bool) False     | The indicator of whether the larger metric is better.         | - |
+| `hpo.scheduler` |     (string) 'rs' </br> Choices: {'rs', 'sha', 'wrap_sha'}     | Which algorithm to use.         | - |
+| `hpo.metric` |     (string) 'client_summarized_weighted_avg.val_loss'     | Metric to be optimized.         | - |
+
+#### Successive Halving Algorithm (SHA)
+
+| Name | (Type) Default Value | Description                                | Note |
+|:----:|:--------------------:|:-------------------------------------------|:-----|
+| `hpo.sha.elim_rate` |     (int) 3     | Reserve only top 1/`hpo.sha.elim_rate` hyperparameter configurations in each state.        | - |
+| `hpo.sha.budgets` |     (list of int) []     | Budgets for each SHA stage.        | - |
+
+
+#### FedEx
+
+| Name | (Type) Default Value | Description                                | Note |
+|:----:|:--------------------:|:-------------------------------------------|:-----|
+| `hpo.fedex.use` |     (bool) False     | Whether to use FedEx.        | - |
+| `hpo.fedex.ss` |     (striing) ''     | Path of the .yaml specifying the search space to be explored.        | - |
+| `hpo.fedex.flatten_ss` |     (bool) True     | Whether the search space has been flattened.        | - |
+| `hpo.fedex.eta0` |     (float) -1.0     | Initial learning rate.        | -1.0 means automatically determine the learning rate based on the size of search space. |
+| `hpo.fedex.sched` |     (string) 'auto' </br> Choices: {'auto', 'adaptive', 'aggressive', 'constant', 'scale' } | The strategy to update step sizes    | - |
+| `hpo.fedex.cutoff` |     (float) 0.0 | The entropy level below which to stop updating the config.        | - |
+| `hpo.fedex.gamma` |     (float) 0.0 | The discount factor; 0.0 is most recent, 1.0 is mean.        | - |
+| `hpo.fedex.diff` |     (bool) False | Whether to use the difference of validation losses before and after the local update as the reward signal.        | - |
+
+#### Wrappers for FedEx 
+
+| Name | (Type) Default Value | Description                                | Note |
+|:----:|:--------------------:|:-------------------------------------------|:-----|
+| `hpo.table.eps` |     (float) 0.1 | The probability to make local perturbation.        | Larger values lead to drastically different arms of the bandit FedEx attempts to solve. |
+| `hpo.table.num` |     (int) 27 | The number of arms of the bandit FedEx attempts to solve.        | - |
+| `hpo.table.idx` |     (int) 0 | The key (i.e., name) of the hyperparameter wrapper considers.        | No need to change this argument. |
+
+
+### Attack 
+
+The configurations related to the data/dataset are defined in `cfg_attack.py`.
+
+| [Privacy Attack](#for-privacy-attack) | [Back-door Attack](#for-back-door-attack) | 
+
+
+#### For Privacy Attack
+| Name |  (Type) Default Value |  Description  | Note |
+|:----:|:-----:|:---------- |:---- |
+`attack.attack_method` | (str) '' | Attack method name | Choices: {'gan_attack', 'GradAscent', 'PassivePIA', 'DLG', 'IG', 'backdoor'} |
+`attack.target_label_ind` | (int) -1 | The target label to attack | Used in class representative attack (GAN based method) and back-door attack; defult -1 means no label to target|
+`attack.attacker_id` | (int) -1 | The id of the attack client | Default -1 means no client as attacker; Used in both privacy attack and back-door attack when client is the attacker |
+`attack.reconstruct_lr `| (float) 0.01 | The learning rate of the optimization based training data/label inference attack|-|
+`attack.reconstruct_optim` | (str) 'Adam' | The learning rate of the optimization based training data/label inference attack|Choices: {'Adam', 'SGD', 'LBFGS'}|
+`attack.info_diff_type` | (str) 'l2' | The distance to compare the ground-truth info (gradients or model updates) and the info generated by the dummy data. | Options: 'l2', 'l1', 'sim' representing L2, L1 and cosin similarity |
+`attack.max_ite` | (int) 400 | The maximum iteration of the optimization based training data/label inference attack |-|
+`attack.alpha_TV` | (float) 0.001 | The hyperparameter of the total variance term | Used in the mehtod invert gradint |
+`attack.inject_round` | (int) 0 | The round to start performing the attack actions |-|
+`attack.classifier_PIA` | (str) 'randomforest' | The property inference classifier name |-|
+ `attack.mia_simulate_in_round`|(int) 20 | The round to add the target data into training batch| Used When simulate the case that the target data are in the training set|
+ `attack. mia_is_simulate_in` | (bool) False | whether simulate the case that the target data are in the training set||
+
+#### For Back-door Attack
+| Name |  (Type) Default Value |  Description  | Note |
+|:----:|:-----:|:---------- |:---- |
+`attack.edge_path` |(str) 'edge_data/' | The folder where the ood data used by edge-case backdoor attacks located  |-|
+`attack.trigger_path` |(str) 'trigger/'|The folder where the trigger pictures used by pixel-wise backdoor attacks located  |-|
+`attack.setting` | (str) 'fix'| The setting about how to select the attack client. |Choices:{'fix', 'single', and 'all'}, 'single' setting means the attack client can be only selected in the predefined round (cfg.attack.insert_round). 'all' setting means the attack client can be selected in all round. 'fix' setting means that the attack client can be selected every freq round. freq has beed defined in the cfg.attack.freq keyword.|
+`attack.freq` | (int) 10 |This keyword is used in the 'fix' setting. The attack client can be selected every freq round.|-| 
+`attack.insert_round` |(int) 100000 |This keyword is used in the 'single' setting. The attack client can be only selected in the insert_round round.|-|
+`attack.mean` |(list) [0.9637] |The mean value which is used in the normalization procedure of poisoning data. |Notice: The length of this list must be same as the number of channels of used dataset.|
+`attack.std` |(list) [0.1592] |The std value which is used in the normalization procedure of poisoning data.|Notice: The length of this list must be same as the number of channels of used dataset.|
+`attack.trigger_type`|(str) 'edge'|This keyword represents the type of used triggers|Choices: {'edge', 'gridTrigger', 'hkTrigger', 'sigTrigger', 'wanetTrigger', 'fourCornerTrigger'}|
+`attack.label_type` |(str) 'dirty'| This keyword represents the type of used attack.|It contains 'dirty'-label and 'clean'-label attacks. Now, we only support 'dirty'-label attack. |
+`attack.edge_num` |(int) 100 | This keyword represents the number of used good samples for edge-case attack.|-|
+`attack.poison_ratio` |(float) 0.5|This keyword represents the percentage of samples with pixel-wise triggers in the local dataset of attack client|-|
+`attack.scale_poisoning` |(bool) False| This keyword represents whether to use the model scaling attack for attack client. |-|
+`attack.scale_para` |(float) 1.0 |This keyword represents the value to amplify the model update when conducting the model scaling attack.|-|
+`attack.pgd_poisoning` |(bool) False|This keyword represents whether to use the pgd to train the local model for attack client. |-|
+`attack.pgd_lr` | (float) 0.1 |This keyword represents learning rate of pgd training for attack client.|-|
+`attack.pgd_eps`|(int) 2 | This keyword represents perturbation budget of pgd training for attack client.|-|
+`attack.self_opt` |(bool) False |This keyword represents whether to use his own training procedure for attack client.|-|
+`attack.self_lr` |(float) 0.05|This keyword represents learning rate of his own training procedure for attack client.|-|
+`attack.self_epoch` |(int) 6 |This keyword represents epoch number of his own training procedure for attack client.|-|
